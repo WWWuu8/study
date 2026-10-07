@@ -1,1 +1,1 @@
-# ConsoleApplication1
+拿到服务端ip写在客户端中生成exe文件再运行
