@@ -1,12 +1,448 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
-<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <PropertyGroup>
-    <ShowAllFiles>false</ShowAllFiles>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
-  </PropertyGroup>
-</Project>
+#define _CRT_SECURE_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <atlimage.h>
+#include <objidl.h>
+#include <gdiplus.h>
+#include <ShellScalingApi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "Shcore.lib")
+
+#define SERVER_PORT 8080
+#define MAGIC       0x12345678
+#define BUF_SIZE    65536
+#define REMOTE_INPUT_TAG 0x52454D4F
+
+#define CHUNK_HEADER_SIZE 24
+#define CHUNK_DATA_SIZE   (BUF_SIZE - CHUNK_HEADER_SIZE)
+
+// 图片块：totalSize / chunkIndex / chunkCount / width / height / format
+// format：1 = JPEG
+
+enum CMD
+{
+    CMD_SCREEN = 1,
+    CMD_MOUSE = 2,
+    CMD_KEY = 4,
+    CMD_TESTCONNECT = 8,
+    CMD_SCREEN_DATA = 100,
+    CMD_SCREEN_SKIP = 101,
+    CMD_ECHO = 200
+};
+
+enum ENUM_MOUSE_BUTTON
+{
+    MOUSE_BUTTON_MOVE = 1,
+    MOUSE_BUTTON_LEFT_DOWN,
+    MOUSE_BUTTON_RIGHT_DOWN,
+    MOUSE_BUTTON_MIDDLE_DOWN,
+    MOUSE_BUTTON_LEFT_UP,
+    MOUSE_BUTTON_RIGHT_UP,
+    MOUSE_BUTTON_MIDDLE_UP,
+    MOUSE_BUTTON_LEFT,
+    MOUSE_BUTTON_RIGHT,
+    MOUSE_BUTTON_MIDDLE,
+    MOUSE_BUTTON_LEFT_DOUBLE,
+    MOUSE_BUTTON_RIGHT_DOUBLE,
+    MOUSE_BUTTON_MIDDLE_DOUBLE,
+    MOUSE_BUTTON_WHEEL
+};
+
+#pragma pack(push, 1)
+typedef struct
+{
+    int action;
+    POINT posXY;
+    int extra;
+} Mouse;
+
+typedef struct
+{
+    int virtual_code;
+    int key_status;
+    int ext_flags;
+} KEY;
+
+typedef struct
+{
+    uint32_t magic;
+    uint32_t cmd;
+    uint32_t body_len;
+} PacketHeader;
+#pragma pack(pop)
+
+typedef struct
+{
+    PacketHeader header;
+    char body[BUF_SIZE];
+} Packet;
+
+static int recv_exact(SOCKET s, char* buf, int n)
+{
+    int got = 0;
+    while (got < n)
+    {
+        int ret = recv(s, buf + got, n - got, 0);
+        if (ret <= 0) return ret;
+        got += ret;
+    }
+    return got;
+}
+
+static int send_exact(SOCKET s, const char* buf, int n)
+{
+    int sent = 0;
+    while (sent < n)
+    {
+        int ret = send(s, buf + sent, n - sent, 0);
+        if (ret <= 0) return ret;
+        sent += ret;
+    }
+    return sent;
+}
+
+static int send_packet(SOCKET s, uint32_t cmd, const char* body, uint32_t body_len)
+{
+    if (s == INVALID_SOCKET || body_len > BUF_SIZE) return -1;
+
+    PacketHeader h;
+    h.magic = htonl(MAGIC);
+    h.cmd = htonl(cmd);
+    h.body_len = htonl(body_len);
+
+    if (send_exact(s, (const char*)&h, sizeof(h)) != sizeof(h)) return -1;
+    if (body_len > 0 && send_exact(s, body, (int)body_len) != (int)body_len) return -1;
+    return 0;
+}
+
+static int recv_packet(SOCKET s, Packet* packet)
+{
+    if (!packet) return -1;
+
+    int ret = recv_exact(s, (char*)&packet->header, sizeof(PacketHeader));
+    if (ret == 0) return 1;
+    if (ret < 0) return -1;
+
+    uint32_t magic = ntohl(packet->header.magic);
+    uint32_t cmd = ntohl(packet->header.cmd);
+    uint32_t body_len = ntohl(packet->header.body_len);
+
+    if (magic != MAGIC || body_len > BUF_SIZE) return -1;
+    if (body_len > 0 && recv_exact(s, packet->body, (int)body_len) != (int)body_len) return -1;
+
+    packet->header.magic = magic;
+    packet->header.cmd = cmd;
+    packet->header.body_len = body_len;
+    return 0;
+}
+
+static int init_winsock(void)
+{
+    WSADATA wsa;
+    return WSAStartup(MAKEWORD(2, 2), &wsa) == 0 ? 0 : -1;
+}
+
+static SOCKET create_listen_socket(void)
+{
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+
+    int reuse = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
+
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(SERVER_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR ||
+        listen(s, SOMAXCONN) == SOCKET_ERROR)
+    {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    return s;
+}
+
+static SOCKET accept_client(SOCKET lfd)
+{
+    sockaddr_in addr = {};
+    int len = sizeof(addr);
+    SOCKET cfd = accept(lfd, (sockaddr*)&addr, &len);
+    if (cfd == INVALID_SOCKET) return INVALID_SOCKET;
+
+    int flag = 1;
+    int bufSize = 1024 * 1024;
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, (char*)&bufSize, sizeof(bufSize));
+    setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, (char*)&bufSize, sizeof(bufSize));
+
+    char ip[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+    printf("客户端 %s:%d 已连接\n", ip, ntohs(addr.sin_port));
+    return cfd;
+}
+
+static int HandleMouse(Packet* packet)
+{
+    if (packet->header.body_len < sizeof(Mouse)) return -1;
+
+    Mouse mouse;
+    memcpy(&mouse, packet->body, sizeof(mouse));
+
+    // 移动包只做一次位置同步，不额外制造按钮事件。
+    if (mouse.action == MOUSE_BUTTON_MOVE)
+    {
+        SetCursorPos(mouse.posXY.x, mouse.posXY.y);
+        return 0;
+    }
+
+    INPUT input = {};
+    input.type = INPUT_MOUSE;
+    input.mi.dwExtraInfo = REMOTE_INPUT_TAG;
+
+    SetCursorPos(mouse.posXY.x, mouse.posXY.y);
+
+    switch (mouse.action)
+    {
+    case MOUSE_BUTTON_LEFT_DOWN:   input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN; break;
+    case MOUSE_BUTTON_RIGHT_DOWN:  input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN; break;
+    case MOUSE_BUTTON_MIDDLE_DOWN: input.mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN; break;
+    case MOUSE_BUTTON_LEFT_UP:     input.mi.dwFlags = MOUSEEVENTF_LEFTUP; break;
+    case MOUSE_BUTTON_RIGHT_UP:    input.mi.dwFlags = MOUSEEVENTF_RIGHTUP; break;
+    case MOUSE_BUTTON_MIDDLE_UP:   input.mi.dwFlags = MOUSEEVENTF_MIDDLEUP; break;
+    case MOUSE_BUTTON_WHEEL:
+        input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+        input.mi.mouseData = (DWORD)mouse.extra;
+        break;
+    case MOUSE_BUTTON_LEFT:
+        input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+        SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        return SendInput(1, &input, sizeof(input)) == 1 ? 0 : -1;
+    case MOUSE_BUTTON_RIGHT:
+        input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
+        SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+        return SendInput(1, &input, sizeof(input)) == 1 ? 0 : -1;
+    case MOUSE_BUTTON_MIDDLE:
+        input.mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN;
+        SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
+        return SendInput(1, &input, sizeof(input)) == 1 ? 0 : -1;
+    case MOUSE_BUTTON_LEFT_DOUBLE:
+        input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN; SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_LEFTUP;   SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN; SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_LEFTUP;   return SendInput(1, &input, sizeof(input)) == 1 ? 0 : -1;
+    case MOUSE_BUTTON_RIGHT_DOUBLE:
+        input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN; SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_RIGHTUP;   SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN; SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_RIGHTUP;   return SendInput(1, &input, sizeof(input)) == 1 ? 0 : -1;
+    case MOUSE_BUTTON_MIDDLE_DOUBLE:
+        input.mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN; SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;   SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN; SendInput(1, &input, sizeof(input));
+        input.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;   return SendInput(1, &input, sizeof(input)) == 1 ? 0 : -1;
+    default:
+        return 0;
+    }
+
+    return SendInput(1, &input, sizeof(input)) == 1 ? 0 : -1;
+}
+
+static int HandleKey(Packet* packet)
+{
+    if (packet->header.body_len < sizeof(KEY)) return -1;
+
+    KEY key;
+    memcpy(&key, packet->body, sizeof(key));
+
+    INPUT input = {};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = (WORD)key.virtual_code;
+    input.ki.dwFlags = (key.key_status ? KEYEVENTF_KEYUP : 0);
+    input.ki.dwExtraInfo = REMOTE_INPUT_TAG;
+
+    return SendInput(1, &input, sizeof(input)) == 1 ? 0 : -1;
+}
+
+static int HandleScreen(SOCKET cfd)
+{
+    CImage image;
+    HDC screenDC = GetDC(NULL);
+    if (!screenDC) return -1;
+
+    int width = GetSystemMetrics(SM_CXSCREEN);
+    int height = GetSystemMetrics(SM_CYSCREEN);
+
+    if (FAILED(image.Create(width, height, 32)))
+    {
+        ReleaseDC(NULL, screenDC);
+        return -1;
+    }
+
+    HDC imageDC = image.GetDC();
+    if (!imageDC)
+    {
+        ReleaseDC(NULL, screenDC);
+        return -1;
+    }
+
+    BOOL ok = BitBlt(imageDC, 0, 0, width, height, screenDC, 0, 0, SRCCOPY | CAPTUREBLT);
+    image.ReleaseDC();
+    ReleaseDC(NULL, screenDC);
+    if (!ok) return -1;
+
+    IStream* stream = NULL;
+    if (FAILED(CreateStreamOnHGlobal(NULL, TRUE, &stream))) return -1;
+
+    // JPEG 比 PNG 更适合连续桌面帧：编码更快、数据更小，服务端 CPU 和网络压力都低。
+    HRESULT hr = image.Save(stream, Gdiplus::ImageFormatJPEG);
+    if (FAILED(hr))
+    {
+        stream->Release();
+        return -1;
+    }
+
+    STATSTG stat = {};
+    if (FAILED(stream->Stat(&stat, STATFLAG_NONAME)) || stat.cbSize.QuadPart == 0 ||
+        stat.cbSize.QuadPart > UINT32_MAX)
+    {
+        stream->Release();
+        return -1;
+    }
+
+    uint32_t totalSize = (uint32_t)stat.cbSize.QuadPart;
+    uint32_t chunkCount = (totalSize + CHUNK_DATA_SIZE - 1) / CHUNK_DATA_SIZE;
+
+    LARGE_INTEGER zero = {};
+    if (FAILED(stream->Seek(zero, STREAM_SEEK_SET, NULL)))
+    {
+        stream->Release();
+        return -1;
+    }
+
+    HGLOBAL hMem = NULL;
+    if (FAILED(GetHGlobalFromStream(stream, &hMem)))
+    {
+        stream->Release();
+        return -1;
+    }
+
+    unsigned char* data = (unsigned char*)GlobalLock(hMem);
+    if (!data)
+    {
+        stream->Release();
+        return -1;
+    }
+
+    char body[BUF_SIZE];
+    for (uint32_t i = 0; i < chunkCount; ++i)
+    {
+        uint32_t offset = i * CHUNK_DATA_SIZE;
+        uint32_t chunkSize = totalSize - offset;
+        if (chunkSize > CHUNK_DATA_SIZE) chunkSize = CHUNK_DATA_SIZE;
+
+        uint32_t v[6];
+        v[0] = htonl(totalSize);
+        v[1] = htonl(i);
+        v[2] = htonl(chunkCount);
+        v[3] = htonl((uint32_t)width);
+        v[4] = htonl((uint32_t)height);
+        v[5] = htonl(1); // JPEG
+
+        memcpy(body, v, CHUNK_HEADER_SIZE);
+        memcpy(body + CHUNK_HEADER_SIZE, data + offset, chunkSize);
+
+        if (send_packet(cfd, CMD_SCREEN_DATA, body, CHUNK_HEADER_SIZE + chunkSize) != 0)
+        {
+            GlobalUnlock(hMem);
+            stream->Release();
+            return -1;
+        }
+    }
+
+    GlobalUnlock(hMem);
+    stream->Release();
+    return 0;
+}
+
+static int HandleCommand(SOCKET cfd, Packet* packet)
+{
+    switch (packet->header.cmd)
+    {
+    case CMD_SCREEN: return HandleScreen(cfd);
+    case CMD_MOUSE:  return HandleMouse(packet);
+    case CMD_KEY:    return HandleKey(packet);
+    case CMD_TESTCONNECT: return 0;
+    default: return -1;
+    }
+}
+
+int main(void)
+{
+    SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+
+    if (init_winsock() != 0) return 1;
+
+    Gdiplus::GdiplusStartupInput gdipInput;
+    ULONG_PTR gdipToken = 0;
+    if (Gdiplus::GdiplusStartup(&gdipToken, &gdipInput, NULL) != Gdiplus::Ok)
+    {
+        WSACleanup();
+        return 1;
+    }
+
+    SOCKET lfd = create_listen_socket();
+    if (lfd == INVALID_SOCKET)
+    {
+        Gdiplus::GdiplusShutdown(gdipToken);
+        WSACleanup();
+        return 1;
+    }
+
+    printf("服务器启动成功，等待客户端连接...\n");
+    SOCKET cfd = accept_client(lfd);
+    if (cfd == INVALID_SOCKET)
+    {
+        closesocket(lfd);
+        Gdiplus::GdiplusShutdown(gdipToken);
+        WSACleanup();
+        return 1;
+    }
+
+    Packet* packet = (Packet*)malloc(sizeof(Packet));
+    if (!packet)
+    {
+        closesocket(cfd); closesocket(lfd);
+        Gdiplus::GdiplusShutdown(gdipToken); WSACleanup();
+        return 1;
+    }
+
+    while (1)
+    {
+        int ret = recv_packet(cfd, packet);
+        if (ret == 1) break;
+        if (ret != 0) break;
+        if (HandleCommand(cfd, packet) != 0) break;
+    }
+
+    free(packet);
+    closesocket(cfd);
+    closesocket(lfd);
+    Gdiplus::GdiplusShutdown(gdipToken);
+    WSACleanup();
+    return 0;
+}
