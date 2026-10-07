@@ -1,6 +1,1052 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
-<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
-  </PropertyGroup>
-</Project>
+// ============================================================
+// 客户端（控制端）：显示远端画面 + 回传鼠标键盘
+// ------------------------------------------------------------
+// 相对原版的主要改动（★=确定性 bug，不修就是错误行为）：
+//  ★ winProc 第一个 switch 只有 break 没有 return，且函数末尾缺 return →
+//    命中"注入消息"分支时返回值是垃圾（MSVC C4715，运行期行为未定义）
+//  ★ WM_DESTROY / WM_PAINT 缺 break → 落到下一个 case：
+//    关窗口时会再跑一遍 WM_PAINT；每次重绘完还会白送一个鼠标移动包
+//  ★ 用 LOWORD/HIWORD 取坐标 → 负坐标变成 65535 之类的大正数，
+//    鼠标拖出窗口边缘时光标瞬间飞到屏幕右下角。改用 GET_X_LPARAM
+//  ★ GetWindowLongPtr 取出的 fd 只判了 INVALID_SOCKET：
+//    SetWindowLongPtr 在 connect 之后才调用，窗口刚创建时 USERDATA 是 0，
+//    0 != INVALID_SOCKET，于是拿 socket 0 去 send。改为显式写入 INVALID_SOCKET
+//  ★ 两个线程同时往一个 socket 写（UI 线程发输入 / 接收线程发请求）→
+//    包可能交错，服务端解出来就是"magic 错误"。加发送临界区
+//  ★ 每收一个分块 printf 一次：1080p PNG 一帧 2000 块 = 2000 次控制台 I/O，
+//    这本身就是最大的性能杀手。改为帧级别日志
+//  ★ 请求下一帧前没有任何等待（注释里写了要等，代码是空的）→
+//    请求积压，服务端处理不过来，鼠标延迟越滚越大。改为"收到并显示完一帧才请求下一帧"
+//  [鼠标] WM_MOUSEMOVE 合并 + 限频（默认 125Hz），只发最新位置，
+//         并且发送动作挪到独立线程，UI 线程不再被 send 阻塞
+//  [鼠标] 按下时 SetCapture、抬起时 ReleaseCapture，拖拽出窗口也不丢事件
+//  [键盘] 过滤 WM_KEYDOWN 的自动重复（lParam bit30），否则打字速度翻倍；
+//         带上扩展键标志（lParam bit24），方向键/右键 Ctrl 才不会错
+//  [协议] BUF_SIZE 65536、分块头 24 字节、JPEG 解码，与服务端一致
+//  [显示] WM_ERASEBKGND 直接返回 1，消除拖动窗口时的闪烁
+//  注意：本文件的 BUF_SIZE / CHUNK_HEADER_SIZE / 结构体定义必须和服务端完全一致
+// ============================================================
+
+#define _CRT_SECURE_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include <windows.h>
+#include <windowsx.h>      // GET_X_LPARAM / GET_Y_LPARAM
+#include <atlimage.h>
+#include <objidl.h>
+#include <gdiplus.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "gdiplus.lib")
+
+// ============================================================
+// 配置
+// ============================================================
+
+#define SERVER_PORT   8080
+#define SERVER_IP      "192.168.2.9" 
+#define MAGIC         0x12345678
+#define BUF_SIZE      65536          // 必须和服务端一致
+
+#define CLIENT_W      1000
+#define CLIENT_H      640
+
+// 鼠标移动的最小发送间隔(ms)：8 ≈ 125Hz，跟手且不至于打满带宽
+// 想更省流量调到 16（60Hz）；想更顺滑调到 4（250Hz）
+#define MOUSE_MOVE_INTERVAL_MS   10   // 100Hz：只发最新鼠标位置
+
+// 画面无变化时的轮询间隔(ms)，避免空转
+#define IDLE_SLEEP_MS            20
+
+#define INPUT_QUEUE_CAP          512
+#define REMOTE_INPUT_TAG         0x52454D4F   // 'REMO'，与服务端 dwExtraInfo 一致
+
+// ============================================================
+// 协议定义（与服务端逐字节一致）
+// ============================================================
+
+enum CMD
+{
+	CMD_SCREEN = 1,
+	CMD_MOUSE = 2,
+	CMD_KEY = 4,
+	CMD_TESTCONNECT = 8,
+
+	CMD_SCREEN_DATA = 100,
+	CMD_SCREEN_SKIP = 101,
+	CMD_ECHO = 200
+};
+
+enum ENUM_MOUSE_BUTTON
+{
+	MOUSE_BUTTON_MOVE = 1,
+	MOUSE_BUTTON_LEFT_DOWN = 2,
+	MOUSE_BUTTON_RIGHT_DOWN = 3,
+	MOUSE_BUTTON_MIDDLE_DOWN = 4,
+	MOUSE_BUTTON_LEFT_UP = 5,
+	MOUSE_BUTTON_RIGHT_UP = 6,
+	MOUSE_BUTTON_MIDDLE_UP = 7,
+	MOUSE_BUTTON_LEFT = 8,
+	MOUSE_BUTTON_RIGHT = 9,
+	MOUSE_BUTTON_MIDDLE = 10,
+	MOUSE_BUTTON_LEFT_DOUBLE = 11,
+	MOUSE_BUTTON_RIGHT_DOUBLE = 12,
+	MOUSE_BUTTON_MIDDLE_DOUBLE = 13,
+	MOUSE_BUTTON_WHEEL = 14
+};
+
+#pragma pack(push, 1)
+
+struct Mouse
+{
+	int   action;
+	POINT posXY;
+	int   extra;
+};
+
+struct KEY
+{
+	int virtual_code;
+	int key_status;    // 0 按下 / 1 放开
+	int ext_flags;     // 1 = 扩展键
+};
+
+#pragma pack(pop)
+
+#define CHUNK_HEADER_SIZE 24
+#define CHUNK_DATA_SIZE   (BUF_SIZE - CHUNK_HEADER_SIZE)
+
+#pragma pack(push, 1)
+
+typedef struct
+{
+	uint32_t magic;
+	uint32_t cmd;
+	uint32_t body_len;
+} PacketHeader;
+
+#pragma pack(pop)
+
+typedef struct Packet
+{
+	PacketHeader header;
+	char         body[BUF_SIZE];
+} Packet;
+
+// ============================================================
+// 全局状态
+// ============================================================
+
+static HWND             hwnd = NULL;
+static CImage           image;              // 当前显示的帧
+static CRITICAL_SECTION image_cs;           // 保护 image / g_width / g_height
+static int              g_width = 0;
+static int              g_height = 0;
+
+static CRITICAL_SECTION g_send_cs;          // 保护 socket 写
+static volatile LONG    g_running = 1;
+static volatile LONG    g_connected = 0;
+
+static SOCKET           g_fd = INVALID_SOCKET;
+
+// ---- 输入队列（UI 线程写，输入线程读）----
+struct InputItem
+{
+	uint32_t cmd;                 // CMD_MOUSE / CMD_KEY
+	union { Mouse m; KEY k; } u;
+};
+
+static InputItem        g_queue[INPUT_QUEUE_CAP];
+static int              g_q_head = 0;
+static int              g_q_count = 0;
+static CRITICAL_SECTION g_q_cs;
+static HANDLE           g_input_event = NULL;
+
+// 鼠标移动单独放一个"最新值"槽位：中间过程可以被覆盖丢弃，只发最新位置
+static POINT            g_latest_move = { 0, 0 };
+static volatile LONG    g_move_dirty = 0;
+static DWORD            g_next_move_time = 0;
+
+static ULONG_PTR        g_gdip_token = 0;
+
+// ============================================================
+// 前置声明
+// ============================================================
+
+static LRESULT CALLBACK winProc(HWND, UINT, WPARAM, LPARAM);
+static int  send_packet(SOCKET s, uint32_t cmd, const char* body, uint32_t body_len);
+static int  recv_packet(SOCKET s, Packet* packet);
+static DWORD WINAPI RecvThread(LPVOID param);
+static DWORD WINAPI InputThread(LPVOID param);
+
+// ============================================================
+// GDI+（CImage 解码 JPEG/PNG 需要）
+// ============================================================
+
+static bool GdiplusInit()
+{
+	Gdiplus::GdiplusStartupInput input;
+	return Gdiplus::GdiplusStartup(&g_gdip_token, &input, NULL) == Gdiplus::Ok;
+}
+
+static void GdiplusShutdown()
+{
+	if (g_gdip_token) { Gdiplus::GdiplusShutdown(g_gdip_token); g_gdip_token = 0; }
+}
+
+// ============================================================
+// Winsock
+// ============================================================
+
+static int init_winsock()
+{
+	WSADATA wsaData;
+	int ret = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	if (ret != 0) { printf("WSAStartup失败：%d\n", ret); return -1; }
+	return 0;
+}
+
+static SOCKET create_client_socket()
+{
+	SOCKET fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (fd == INVALID_SOCKET) printf("socket创建失败：%d\n", WSAGetLastError());
+	return fd;
+}
+
+static int connect_server(SOCKET fd, const char* ip, unsigned short port)
+{
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+
+	if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1)
+	{
+		printf("IP地址错误\n");
+		return -1;
+	}
+	if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
+	{
+		printf("connect失败：%d\n", WSAGetLastError());
+		return -1;
+	}
+
+	// 关掉 Nagle：鼠标/键盘这种小包最怕被攒着一起发
+	int flag = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&flag, sizeof(flag));
+	int bufsz = 512 * 1024;
+	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsz, sizeof(bufsz));
+	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsz, sizeof(bufsz));
+	return 0;
+}
+
+// ============================================================
+// 收发原语
+// ============================================================
+
+static int recv_exact(SOCKET s, char* buf, int n)
+{
+	int got = 0;
+	while (got < n)
+	{
+		int ret = recv(s, buf + got, n - got, 0);
+		if (ret <= 0) return ret;
+		got += ret;
+	}
+	return got;
+}
+
+static int send_exact(SOCKET s, const char* buf, int n)
+{
+	int sent = 0;
+	while (sent < n)
+	{
+		int ret = send(s, buf + sent, n - sent, 0);
+		if (ret <= 0) return ret;
+		sent += ret;
+	}
+	return sent;
+}
+
+// 线程安全发包（UI 输入线程 + 接收线程共用一个 socket，必须互斥）
+static int send_packet(SOCKET s, uint32_t cmd, const char* body, uint32_t body_len)
+{
+	if (s == INVALID_SOCKET || body_len > BUF_SIZE) return -1;
+
+	PacketHeader header;
+	header.magic = htonl(MAGIC);
+	header.cmd = htonl(cmd);
+	header.body_len = htonl(body_len);
+
+	EnterCriticalSection(&g_send_cs);
+	int ret = send_exact(s, (const char*)&header, sizeof(header));
+	if (ret == sizeof(header) && body_len > 0)
+		ret = send_exact(s, body, (int)body_len);
+	LeaveCriticalSection(&g_send_cs);
+
+	if (body_len == 0) return ret == sizeof(header) ? 0 : -1;
+	return ret == (int)body_len ? 0 : -1;
+}
+
+static int recv_packet(SOCKET s, Packet* packet)
+{
+	if (packet == NULL) return -1;
+
+	int ret = recv_exact(s, (char*)&packet->header, sizeof(PacketHeader));
+	if (ret == 0) return 1;
+	if (ret < 0)  return -1;
+
+	uint32_t magic = ntohl(packet->header.magic);
+	uint32_t cmd = ntohl(packet->header.cmd);
+	uint32_t body_len = ntohl(packet->header.body_len);
+
+	if (magic != MAGIC) { printf("协议错误：magic错误\n"); return -1; }
+	if (body_len > BUF_SIZE) { printf("非法body长度：%u\n", body_len); return -1; }
+
+	if (body_len > 0)
+	{
+		ret = recv_exact(s, packet->body, (int)body_len);
+		if (ret <= 0) return -1;
+	}
+
+	// 注意：写回主机字节序，调用方不要再次 ntohl
+	packet->header.magic = magic;
+	packet->header.cmd = cmd;
+	packet->header.body_len = body_len;
+	return 0;
+}
+
+// ============================================================
+// 坐标映射：窗口客户区 → 服务端屏幕绝对坐标
+// 用 LONGLONG 中间量避免乘法溢出，并做钳位
+// （SetCapture 之后坐标可能是负数或超出客户区）
+// ============================================================
+
+static BOOL MapToServer(int cx, int cy, POINT* out)
+{
+	if (hwnd == NULL || out == NULL) return FALSE;
+
+	RECT r;
+	GetClientRect(hwnd, &r);
+	int cw = r.right - r.left;
+	int ch = r.bottom - r.top;
+	if (cw <= 0 || ch <= 0) return FALSE;
+
+	EnterCriticalSection(&image_cs);
+	int sw = g_width;
+	int sh = g_height;
+	LeaveCriticalSection(&image_cs);
+	if (sw <= 0 || sh <= 0) return FALSE;
+
+	int x = (int)(((LONGLONG)cx * sw) / cw);
+	int y = (int)(((LONGLONG)cy * sh) / ch);
+
+	if (x < 0) x = 0; else if (x >= sw) x = sw - 1;
+	if (y < 0) y = 0; else if (y >= sh) y = sh - 1;
+
+	out->x = x;
+	out->y = y;
+	return TRUE;
+}
+
+// ============================================================
+// 输入队列
+// ============================================================
+
+// 点击/按键入队（保序，不可丢弃）
+static void PushInput(uint32_t cmd, const void* data, int size)
+{
+	EnterCriticalSection(&g_q_cs);
+	if (g_q_count >= INPUT_QUEUE_CAP)
+	{
+		// 队列满：丢掉最旧的一条，保证最新输入能发出去（比卡死强）
+		g_q_head = (g_q_head + 1) % INPUT_QUEUE_CAP;
+		g_q_count--;
+	}
+	int tail = (g_q_head + g_q_count) % INPUT_QUEUE_CAP;
+	g_queue[tail].cmd = cmd;
+	memcpy(&g_queue[tail].u, data, (size_t)size);
+	g_q_count++;
+	LeaveCriticalSection(&g_q_cs);
+
+	SetEvent(g_input_event);
+}
+
+// 鼠标移动：只更新"最新位置"，天然合并掉中间过程
+static void PushMove(const POINT* serverPt)
+{
+	EnterCriticalSection(&g_q_cs);
+	g_latest_move = *serverPt;
+	g_move_dirty = 1;
+	LeaveCriticalSection(&g_q_cs);
+
+	SetEvent(g_input_event);
+}
+
+static void SendMouse(SOCKET fd, int action, const POINT* pt, int extra)
+{
+	Mouse m;
+	m.action = action;
+	m.posXY = *pt;
+	m.extra = extra;
+	send_packet(fd, CMD_MOUSE, (const char*)&m, sizeof(m));
+}
+
+// ============================================================
+// 输入发送线程
+// ------------------------------------------------------------
+// 原版在 winProc 里直接 send_packet：
+//   ① UI 线程被网络 I/O 阻塞，鼠标移动一多窗口就发卡
+//   ② 和接收线程并发写同一个 socket，字节流交错 → 服务端报 magic 错误
+// 现在 UI 线程只入队，真正的 send 全在这个线程里串行完成。
+// ============================================================
+
+static DWORD WINAPI InputThread(LPVOID param)
+{
+	SOCKET fd = (SOCKET)(INT_PTR)param;
+
+	while (g_running)
+	{
+		// ---- 计算这次该等多久 ----
+		DWORD wait = 200;
+		EnterCriticalSection(&g_q_cs);
+		int  hasQueue = (g_q_count > 0);
+		int  hasMove = (g_move_dirty != 0);
+		LeaveCriticalSection(&g_q_cs);
+
+		if (hasQueue)
+		{
+			wait = 0;                       // 有按键/点击，立刻发
+		}
+		else if (hasMove)
+		{
+			DWORD now = GetTickCount();
+			wait = (now >= g_next_move_time) ? 0 : (g_next_move_time - now);
+		}
+
+		WaitForSingleObject(g_input_event, wait);
+		if (!g_running) break;
+
+		// ---- 取出这批事件 ----
+		InputItem batch[64];
+		int n = 0;
+		int   doMove = 0;
+		POINT movePt = { 0, 0 };
+
+		EnterCriticalSection(&g_q_cs);
+		while (n < 64 && g_q_count > 0)
+		{
+			batch[n++] = g_queue[g_q_head];
+			g_q_head = (g_q_head + 1) % INPUT_QUEUE_CAP;
+			g_q_count--;
+		}
+		DWORD now = GetTickCount();
+		if (g_move_dirty && now >= g_next_move_time)
+		{
+			doMove = 1;
+			movePt = g_latest_move;
+			g_move_dirty = 0;
+			g_next_move_time = now + MOUSE_MOVE_INTERVAL_MS;
+		}
+		LeaveCriticalSection(&g_q_cs);
+
+		// ---- 发送 ----
+		for (int i = 0; i < n && g_running; i++)
+		{
+			if (batch[i].cmd == CMD_MOUSE)
+				send_packet(fd, CMD_MOUSE, (const char*)&batch[i].u.m, sizeof(Mouse));
+			else if (batch[i].cmd == CMD_KEY)
+				send_packet(fd, CMD_KEY, (const char*)&batch[i].u.k, sizeof(KEY));
+		}
+
+		if (doMove && g_running)
+		{
+			SendMouse(fd, MOUSE_BUTTON_MOVE, &movePt, 0);
+		}
+	}
+	return 0;
+}
+
+// ============================================================
+// 消息处理
+// ============================================================
+
+// 判断这条消息是不是服务端注入回来的（同机调试时的鼠标死循环源头）
+static BOOL IsRemoteInjected()
+{
+	return (GetMessageExtraInfo() == (LPARAM)REMOTE_INPUT_TAG) ? TRUE : FALSE;
+}
+
+// 把一次鼠标按键事件转成协议 action 并入队
+static void QueueMouseButton(HWND hWnd, UINT msg, LPARAM lParam)
+{
+	if (!g_connected) return;
+
+	// ★ 关键：GET_X_LPARAM 是有符号的。
+	//   原版 LOWORD(lParam) 返回 unsigned short，拖出窗口左上角时
+	//   -5 会变成 65531，映射后光标直接飞到屏幕另一端。
+	int cx = GET_X_LPARAM(lParam);
+	int cy = GET_Y_LPARAM(lParam);
+
+	POINT pt;
+	if (!MapToServer(cx, cy, &pt)) return;
+
+	int action = 0;
+	switch (msg)
+	{
+	case WM_LBUTTONDOWN:     action = MOUSE_BUTTON_LEFT_DOWN;   break;
+	case WM_LBUTTONUP:       action = MOUSE_BUTTON_LEFT_UP;     break;
+	case WM_LBUTTONDBLCLK:   action = MOUSE_BUTTON_LEFT_DOUBLE; break;
+	case WM_RBUTTONDOWN:     action = MOUSE_BUTTON_RIGHT_DOWN;  break;
+	case WM_RBUTTONUP:       action = MOUSE_BUTTON_RIGHT_UP;    break;
+	case WM_RBUTTONDBLCLK:   action = MOUSE_BUTTON_RIGHT_DOUBLE; break;
+	case WM_MBUTTONDOWN:     action = MOUSE_BUTTON_MIDDLE_DOWN; break;
+	case WM_MBUTTONUP:       action = MOUSE_BUTTON_MIDDLE_UP;   break;
+	case WM_MBUTTONDBLCLK:   action = MOUSE_BUTTON_MIDDLE_DOUBLE; break;
+	default: return;
+	}
+
+	Mouse m;
+	m.action = action;
+	m.posXY = pt;
+	m.extra = 0;
+	PushInput(CMD_MOUSE, &m, sizeof(m));
+}
+
+static LRESULT CALLBACK winProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	// --------------------------------------------------------
+	// 服务端 SendInput 注入的消息会被本机窗口收到（同机调试时），
+	// 如果照样回传就形成死循环：转发→注入→再转发→……
+	// 这里直接交给默认处理，既不转发也不影响本地显示。
+	// 跨机器部署时不存在这个问题（客户端窗口不在服务端屏幕上）。
+	// --------------------------------------------------------
+	switch (msg)
+	{
+	case WM_MOUSEMOVE:
+	case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+	case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+	case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+	case WM_MOUSEWHEEL:
+	case WM_KEYDOWN: case WM_KEYUP:
+	case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+		if (IsRemoteInjected())
+			return DefWindowProc(hWnd, msg, wParam, lParam);
+		break;
+	default:
+		break;
+	}
+
+	switch (msg)
+	{
+		// ---------------- 关闭 ----------------
+	case WM_CLOSE:
+		DestroyWindow(hWnd);
+		return 0;
+
+	case WM_DESTROY:
+		InterlockedExchange(&g_running, 0);
+		SetEvent(g_input_event);
+		// 唤醒可能正阻塞在 recv 的接收线程
+		if (g_fd != INVALID_SOCKET) shutdown(g_fd, SD_BOTH);
+		PostQuitMessage(0);
+		return 0;                       // ★ 原版这里缺 break，会掉进 WM_PAINT
+
+		// ---------------- 背景 ----------------
+	case WM_ERASEBKGND:
+		return 1;                       // 我们自己整幅覆盖，交给系统擦会闪
+
+		// ---------------- 绘制 ----------------
+	case WM_PAINT:
+	{
+		PAINTSTRUCT ps;
+		HDC hdc = BeginPaint(hWnd, &ps);
+
+		RECT rect;
+		GetClientRect(hWnd, &rect);
+		int width = rect.right - rect.left;
+		int height = rect.bottom - rect.top;
+
+		EnterCriticalSection(&image_cs);
+		if (!image.IsNull() && g_width > 0 && g_height > 0)
+		{
+			int oldMode = SetStretchBltMode(hdc, HALFTONE);
+			SetBrushOrgEx(hdc, 0, 0, NULL);
+
+			image.StretchBlt(hdc, 0, 0, width, height,
+				0, 0, g_width, g_height, SRCCOPY);
+
+			SetStretchBltMode(hdc, oldMode);
+		}
+		else
+		{
+			FillRect(hdc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+		}
+		LeaveCriticalSection(&image_cs);
+
+		EndPaint(hWnd, &ps);
+		return 0;                       // ★ 原版这里缺 break，会掉进 WM_MOUSEMOVE
+	}
+
+	case WM_SIZE:
+		InvalidateRect(hWnd, NULL, FALSE);
+		return 0;
+
+		// ---------------- 鼠标移动：合并 + 限频 ----------------
+	case WM_MOUSEMOVE:
+	{
+		if (!g_connected) break;
+		POINT pt;
+		if (MapToServer(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), &pt))
+			PushMove(&pt);
+		return 0;
+	}
+
+	// ---------------- 鼠标按键 ----------------
+	case WM_LBUTTONDOWN:
+	case WM_RBUTTONDOWN:
+	case WM_MBUTTONDOWN:
+		// ★ 按下就捕获鼠标：拖到窗口外面也能继续收到 MOVE/UP，
+		//   否则拖拽操作在窗口边缘就断了
+		SetCapture(hWnd);
+		QueueMouseButton(hWnd, msg, lParam);
+		return 0;
+
+	case WM_LBUTTONUP:
+	case WM_RBUTTONUP:
+	case WM_MBUTTONUP:
+		QueueMouseButton(hWnd, msg, lParam);
+		ReleaseCapture();
+		return 0;
+
+	case WM_LBUTTONDBLCLK:
+	case WM_RBUTTONDBLCLK:
+	case WM_MBUTTONDBLCLK:
+		SetCapture(hWnd);
+		QueueMouseButton(hWnd, msg, lParam);
+		return 0;
+
+	case WM_CAPTURECHANGED:
+		return 0;
+
+		// ---------------- 滚轮 ----------------
+	case WM_MOUSEWHEEL:
+	{
+		if (!g_connected) break;
+		// WM_MOUSEWHEEL 的 lParam 是屏幕坐标，要先转成客户区坐标
+		POINT sp;
+		sp.x = GET_X_LPARAM(lParam);
+		sp.y = GET_Y_LPARAM(lParam);
+		ScreenToClient(hWnd, &sp);
+
+		POINT pt;
+		if (!MapToServer(sp.x, sp.y, &pt)) break;
+
+		Mouse m;
+		m.action = MOUSE_BUTTON_WHEEL;
+		m.posXY = pt;
+		m.extra = GET_WHEEL_DELTA_WPARAM(wParam);   // ±120 的倍数
+		PushInput(CMD_MOUSE, &m, sizeof(m));
+		return 0;
+	}
+
+	// ---------------- 键盘 ----------------
+	case WM_KEYDOWN:
+	case WM_SYSKEYDOWN:
+	case WM_KEYUP:
+	case WM_SYSKEYUP:
+	{
+		if (!g_connected) break;
+
+		BOOL isUp = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
+
+		// ★ 过滤自动重复：按住不放时 Windows 会连续发 WM_KEYDOWN。
+		//   服务端 SendInput 按下后系统自己会产生重复，
+		//   再把客户端的重复转发过去，打字速度直接翻倍。
+		//   lParam bit30 = 前一次按键状态，为 1 说明是重复。
+		if (!isUp && (lParam & (1 << 30))) return 0;
+
+		KEY k;
+		k.virtual_code = (int)(UINT_PTR)wParam;
+
+		// 只针对 Shift 做特殊处理：
+		// VK_SHIFT 本身不能区分左 Shift / 右 Shift。
+		// 用扫描码区分，Shift+字母、Shift+数字等组合键就能稳定配对。
+		if (wParam == VK_SHIFT)
+		{
+			UINT scan = (UINT)((lParam >> 16) & 0xFF);
+			UINT vk = MapVirtualKeyA(scan, MAPVK_VSC_TO_VK_EX);
+			if (vk == VK_LSHIFT || vk == VK_RSHIFT)
+				k.virtual_code = (int)vk;
+		}
+
+		k.key_status = isUp ? 1 : 0;
+		k.ext_flags = (lParam & (1 << 24)) ? 1 : 0;   // bit24 = 扩展键
+		PushInput(CMD_KEY, &k, sizeof(k));
+		return 0;
+	}
+
+	default:
+		return DefWindowProc(hWnd, msg, wParam, lParam);
+	}
+
+	// ★ 原版函数走到这里没有 return，MSVC 报 C4715，返回值是垃圾
+	return 0;
+}
+
+// ============================================================
+// 创建窗口
+// ============================================================
+
+static int init_window(HINSTANCE hInstance, int nShowCmd)
+{
+	WNDCLASSA ws = {};
+	LPCSTR CLASSNAME = "MainWindow";
+
+	ws.lpfnWndProc = winProc;
+	ws.hInstance = hInstance;
+	ws.lpszClassName = CLASSNAME;
+	ws.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+	ws.hCursor = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
+	ws.hIcon = LoadIconA(NULL, (LPCSTR)IDI_APPLICATION);
+	ws.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;   // ★ 要 CS_DBLCLKS 才收得到 WM_LBUTTONDBLCLK
+
+	if (!RegisterClassA(&ws))
+	{
+		char buf[256];
+		sprintf(buf, "窗口注册失败，错误码：%lu", GetLastError());
+		MessageBoxA(NULL, buf, "错误", MB_OK | MB_ICONERROR);
+		return 0;
+	}
+
+	hwnd = CreateWindowA(CLASSNAME, "远程桌面客户端", WS_OVERLAPPEDWINDOW,
+		CW_USEDEFAULT, CW_USEDEFAULT, CLIENT_W, CLIENT_H,
+		NULL, NULL, hInstance, NULL);
+
+	if (hwnd == NULL)
+	{
+		char buf[256];
+		sprintf(buf, "窗口创建失败，错误码：%lu", GetLastError());
+		MessageBoxA(NULL, buf, "错误", MB_OK | MB_ICONERROR);
+		return 0;
+	}
+
+	// ★ 立刻把 USERDATA 置为 INVALID_SOCKET。
+	//   默认值是 0，而 0 != INVALID_SOCKET，
+	//   原版在 connect 之前收到的消息会拿 socket 0 去 send。
+	SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)INVALID_SOCKET);
+
+	ShowWindow(hwnd, nShowCmd);
+	UpdateWindow(hwnd);
+	return 1;
+}
+
+// ============================================================
+// 显示一帧
+// ============================================================
+
+static int DisplayFrame(const unsigned char* data, uint32_t totalSize, int fw, int fh)
+{
+	HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, totalSize);
+	if (hMem == NULL) { printf("GlobalAlloc失败\n"); return -1; }
+
+	void* pMem = GlobalLock(hMem);
+	if (pMem == NULL)
+	{
+		GlobalFree(hMem);
+		return -1;
+	}
+	memcpy(pMem, data, totalSize);
+	GlobalUnlock(hMem);
+
+	IStream* pStream = NULL;
+	// 第二个参数 TRUE：Stream 释放时连带释放 hMem
+	HRESULT hr = CreateStreamOnHGlobal(hMem, TRUE, &pStream);
+	if (FAILED(hr))
+	{
+		printf("创建IStream失败：0x%08X\n", hr);
+		GlobalFree(hMem);
+		return -1;
+	}
+
+	CImage newImage;
+	hr = newImage.Load(pStream);
+	pStream->Release();          // 无论成败都要释放（hMem 随之释放）
+	if (FAILED(hr) || newImage.IsNull())
+	{
+		printf("图片解码失败：0x%08X\n", hr);
+		return -1;
+	}
+
+	// 交给全局 image（WM_PAINT 可能同时在读，必须加锁）
+	EnterCriticalSection(&image_cs);
+	image.Destroy();
+	image.Attach(newImage.Detach());
+
+	// ★ 必须在 Attach 之后取尺寸，拿到的是新图；同时直接用协议里带来的宽高更可靠
+	g_width = (fw > 0) ? fw : image.GetWidth();
+	g_height = (fh > 0) ? fh : image.GetHeight();
+	LeaveCriticalSection(&image_cs);
+
+	InvalidateRect(hwnd, NULL, FALSE);
+	return 0;
+}
+
+// ============================================================
+// 接收线程
+// ------------------------------------------------------------
+// 流程严格 1:1 —— 显示完一帧才请求下一帧。
+// 原版请求前没有任何等待，请求会在服务端积压，
+// 结果就是"画面越来越落后于操作"，延迟只增不减。
+// ============================================================
+
+static DWORD WINAPI RecvThread(LPVOID param)
+{
+	SOCKET fd = (SOCKET)(INT_PTR)param;
+
+	HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	bool needUninit = SUCCEEDED(hr);
+
+	Packet* packet = (Packet*)malloc(sizeof(Packet));
+	if (packet == NULL) { if (needUninit) CoUninitialize(); return 0; }
+
+	// 拼接缓冲
+	unsigned char* frameBuf = NULL;
+	uint32_t totalSize = 0, chunkCount = 0, received = 0;
+	int fw = 0, fh = 0;
+
+	// 发出第一个请求，启动整个循环
+	send_packet(fd, CMD_SCREEN, NULL, 0);
+
+	while (g_running)
+	{
+		int ret = recv_packet(fd, packet);
+		if (ret != 0)
+		{
+			printf(ret == 1 ? "服务端关闭连接\n" : "接收失败\n");
+			break;
+		}
+
+		uint32_t cmd = packet->header.cmd;
+		uint32_t bodyLen = packet->header.body_len;
+
+		// ---------- 画面无变化 ----------
+		if (cmd == CMD_SCREEN_SKIP)
+		{
+			Sleep(IDLE_SLEEP_MS);
+			send_packet(fd, CMD_SCREEN, NULL, 0);
+			continue;
+		}
+
+		if (cmd != CMD_SCREEN_DATA)
+		{
+			printf("收到非帧数据包，cmd=%u\n", cmd);
+			continue;
+		}
+
+		// ---------- 帧数据 ----------
+		if (bodyLen < CHUNK_HEADER_SIZE)
+		{
+			printf("图片块格式错误：body太小\n");
+			break;
+		}
+
+		uint32_t net[6];
+		memcpy(net, packet->body, CHUNK_HEADER_SIZE);
+		uint32_t curTotal = ntohl(net[0]);
+		uint32_t idx = ntohl(net[1]);
+		uint32_t curCount = ntohl(net[2]);
+		uint32_t curW = ntohl(net[3]);
+		uint32_t curH = ntohl(net[4]);
+		// uint32_t format = ntohl(net[5]);  // 0=PNG 1=JPEG，CImage::Load 会自动识别，暂不需要
+
+		uint32_t chunkSize = bodyLen - CHUNK_HEADER_SIZE;
+
+		if (frameBuf == NULL)
+		{
+			// 首块：校验 + 分配
+			if (curTotal == 0 || curCount == 0 || curTotal > 64u * 1024u * 1024u)
+			{
+				printf("图片大小非法：%u\n", curTotal);
+				break;
+			}
+			totalSize = curTotal;
+			chunkCount = curCount;
+			received = 0;
+			fw = (int)curW;
+			fh = (int)curH;
+
+			frameBuf = (unsigned char*)malloc(totalSize);
+			if (frameBuf == NULL) { printf("分配图片内存失败\n"); break; }
+		}
+		else if (curTotal != totalSize || curCount != chunkCount)
+		{
+			printf("图片分块信息不一致\n");
+			free(frameBuf); frameBuf = NULL;
+			break;
+		}
+
+		if (idx >= chunkCount)
+		{
+			printf("非法图片块编号：%u\n", idx);
+			free(frameBuf); frameBuf = NULL;
+			break;
+		}
+
+		uint32_t offset = idx * CHUNK_DATA_SIZE;
+		if (offset > totalSize || chunkSize > totalSize - offset)
+		{
+			printf("图片块越界\n");
+			free(frameBuf); frameBuf = NULL;
+			break;
+		}
+
+		memcpy(frameBuf + offset, packet->body + CHUNK_HEADER_SIZE, chunkSize);
+		received++;
+
+		if (received >= chunkCount)
+		{
+			DWORD t0 = GetTickCount();
+			if (DisplayFrame(frameBuf, totalSize, fw, fh) != 0)
+			{
+				free(frameBuf);
+				frameBuf = NULL;
+				break;
+			}
+			printf("帧：%dx%d  %u字节  %u块  解码+绘制%lums\n",
+				fw, fh, totalSize, chunkCount, GetTickCount() - t0);
+
+			free(frameBuf);
+			frameBuf = NULL;
+			totalSize = chunkCount = received = 0;
+
+			// 显示完再要下一帧，天然形成流控，不会积压
+			if (send_packet(fd, CMD_SCREEN, NULL, 0) != 0) break;
+		}
+	}
+
+	free(frameBuf);
+	free(packet);
+
+	InterlockedExchange(&g_running, 0);
+	InterlockedExchange(&g_connected, 0);
+	SetEvent(g_input_event);
+	if (hwnd) PostMessage(hwnd, WM_CLOSE, 0, 0);
+
+	if (needUninit) CoUninitialize();
+	return 0;
+}
+
+// ============================================================
+// WinMain
+// ============================================================
+
+int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
+	_In_ LPSTR lpCmdLine, _In_ int nShowCmd)
+{
+	(void)hPrevInstance;
+	(void)lpCmdLine;
+
+	InitializeCriticalSection(&image_cs);
+	InitializeCriticalSection(&g_send_cs);
+	InitializeCriticalSection(&g_q_cs);
+	g_input_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+
+	if (!GdiplusInit())
+	{
+		MessageBoxA(NULL, "GDI+ 初始化失败", "错误", MB_OK | MB_ICONERROR);
+		return 1;
+	}
+
+	if (!init_window(hInstance, nShowCmd))
+	{
+		DeleteCriticalSection(&image_cs);
+		DeleteCriticalSection(&g_send_cs);
+		DeleteCriticalSection(&g_q_cs);
+		GdiplusShutdown();
+		return 1;
+	}
+
+	if (init_winsock() != 0) return 1;
+
+	SOCKET fd = create_client_socket();
+	if (fd == INVALID_SOCKET)
+	{
+		WSACleanup();
+		return 1;
+	}
+
+	if (connect_server(fd, SERVER_IP, SERVER_PORT) != 0)
+	{
+		MessageBoxA(NULL, "连接服务器失败！请确认服务器已启动且端口为8080",
+			"网络错误", MB_OK | MB_ICONERROR);
+		closesocket(fd);
+		WSACleanup();
+		return 1;
+	}
+
+	g_fd = fd;
+	SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)fd);
+
+	HANDLE hRecv = CreateThread(NULL, 0, RecvThread, (LPVOID)(INT_PTR)fd, 0, NULL);
+	HANDLE hInput = CreateThread(NULL, 0, InputThread, (LPVOID)(INT_PTR)fd, 0, NULL);
+	if (hRecv == NULL || hInput == NULL)
+	{
+		printf("创建工作线程失败：%lu\n", GetLastError());
+		closesocket(fd);
+		WSACleanup();
+		return 1;
+	}
+
+	// 两个线程都起来了，才允许 winProc 往外发输入
+	InterlockedExchange(&g_connected, 1);
+
+	// ---------------- 消息循环 ----------------
+	MSG msg = {};
+	BOOL ret;
+	while ((ret = GetMessage(&msg, NULL, 0, 0)) > 0)
+	{
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+	if (ret < 0)
+	{
+		char buf[128];
+		sprintf(buf, "GetMessage出错：%lu\n", GetLastError());
+		OutputDebugStringA(buf);
+	}
+
+	// ---------------- 收尾 ----------------
+	InterlockedExchange(&g_running, 0);
+	InterlockedExchange(&g_connected, 0);
+	SetEvent(g_input_event);
+
+	shutdown(fd, SD_BOTH);       // 唤醒阻塞在 recv 的接收线程
+
+	if (hRecv) { WaitForSingleObject(hRecv, 3000); CloseHandle(hRecv); }
+	if (hInput) { WaitForSingleObject(hInput, 3000); CloseHandle(hInput); }
+
+	closesocket(fd);
+	g_fd = INVALID_SOCKET;
+	WSACleanup();
+
+	EnterCriticalSection(&image_cs);
+	if (!image.IsNull()) image.Destroy();
+	LeaveCriticalSection(&image_cs);
+
+	DeleteCriticalSection(&image_cs);
+	DeleteCriticalSection(&g_send_cs);
+	DeleteCriticalSection(&g_q_cs);
+	CloseHandle(g_input_event);
+	GdiplusShutdown();
+	return (int)msg.wParam;
+}
